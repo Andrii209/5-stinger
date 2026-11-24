@@ -9,10 +9,11 @@
 
 	Как работает:
 	- Владелец чипа берёт weapon_rpg -> по центру прицела рисуется круг захвата.
-	- Любой живой игрок в этом круге (и не закрытый стеной) берётся на захват:
-	  круг краснеет, на цели появляется красная метка, пишется LOCK.
+	- В круг берётся живой игрок или техника (машины, кресла/поды, джепы и т.п.),
+	  если цель видна (не за стеной). Круг краснеет, на цели появляется метка,
+	  снизу пишется LOCK.
 	- Выстрел с захватом -> вместо обычной ракеты летит самонаводящаяся ракета
-	  с трассой, она доворачивает к захваченной цели и взрывается.
+	  с трассой, доворачивает к цели и взрывается.
 	- Урон и радиус взрыва настраиваются двумя числами ниже.
 
 	Ставится обычным Starfall-процессором. Владелец чипа = стрелок.
@@ -33,19 +34,62 @@ local SHOT_RANGE    = 220    -- насколько близко к стрелк�
 local ROCKET_MODEL  = "models/weapons/w_missile.mdl"
 local FALLBACK_MDL  = "models/weapons/w_missile_closed.mdl"
 
+-- Всё, что подходит под эти классы, считается техникой-целью
+local VEHICLE_CLASSES = {
+	"prop_vehicle_*",   -- джепы, аирботы, кресла (prisoner_pod), машины и т.п.
+	"simfphys_*",       -- simfphys-машины (если аддон стоит)
+}
+
+-- То, что не должно считаться техникой, даже если попало в список классов
+local NOT_TARGET = {
+	["prop_physics"] = true,
+	["prop_physics_multiplayer"] = true,
+	["prop_ragdoll"] = true,
+	["prop_dynamic"] = true,
+	["rpg_missile"] = true,
+	["starfall_hologram"] = true,
+	["starfall_prop"] = true,
+	["starfall_processor"] = true,
+	["starfall_screen"] = true,
+}
+
+-- ------------------------------------------------------ общие хелперы
+local function centerOf(ent)
+	local ok, mn, mx = pcall(ent.getCollisionBounds, ent)
+	if ok and mn and mx then
+		local center = ent:getPos() + (mn + mx) * 0.5
+		local radius = (mx - mn):getLength() * 0.5
+		return center, math.clamp(radius, 8, 512)
+	end
+	return ent:getPos(), 40
+end
+
+local function marksTarget(ent)
+	if not ent or not ent:isValid() then return false end
+	if ent:isPlayer() then return ent:isAlive() end
+	return true
+end
+
+local function aimPointOf(ent)
+	if ent:isPlayer() then return ent:getPos() + Vector(0, 0, 40), 32 end
+	return centerOf(ent)
+end
+
 if SERVER then
 
 	-- =============================================================== сервер
 	local ownerPly = owner()
 
 	local locked          -- есть захват (нужно клиенту)
-	local target          -- захваченный игрок
+	local target          -- захваченная цель (игрок или техника)
 	local flying = false  -- наша ракета в воздухе
 	local rPos, rDir      -- позиция и направление ракеты
 	local rLife           -- остаток жизни
 	local rTarget         -- цель ракеты
 	local rVisual         -- голограмма-ракета (может отсутствовать)
 	local rTrailT         -- таймер трассы
+
+	local vehicles = {}   -- кэш техники (обновляется реже, чем скан)
 
 	local function ownerOk()
 		return ownerPly:isValid() and ownerPly:isAlive()
@@ -72,42 +116,95 @@ if SERVER then
 		end)
 	end
 
-	------------------------------------------------------------------ захват
-	local function visible(from, point, ply)
+	------------------------------------------------------------------ цели
+	local function refreshVehicles()
+		local list, seen = {}, {}
+
+		local function add(e)
+			if not e or not e:isValid() or seen[e] then return end
+			seen[e] = true
+
+			local class = e:getClass()
+			if NOT_TARGET[class] or e:isWeapon() or e:isPlayer() or e == chip() then return end
+			if e:getSolid() == SOLID.NONE then return end
+
+			list[#list + 1] = e
+		end
+
+		for _, class in ipairs(VEHICLE_CLASSES) do
+			pcall(function()
+				for _, e in ipairs(find.byClass(class)) do add(e) end
+			end)
+		end
+
+		vehicles = list
+	end
+
+	local function visible(from, point, ent)
 		local tr = trace.line(from, point, { ownerPly }, MASK.SOLID)
-		return not tr.Hit or tr.Entity == ply
+		return not tr.Hit or tr.Entity == ent
+	end
+
+	-- Насколько объект (с учётом его габаритов) попадает в конус прицела.
+	-- Возвращает "запас" в градусах: <= 0 значит объект внутри круга.
+	local function coneScore(eye, aim, point, radius, dist)
+		local dot = ((point - eye) / dist):dot(aim)
+		if dot <= 0 then return nil end
+
+		local ang = math.deg(math.acos(math.clamp(dot, -1, 1)))
+		local half = math.deg(math.asin(math.clamp(radius / dist, 0, 0.999)))
+		return ang - half
 	end
 
 	local function findTarget()
 		local eye = ownerPly:getShootPos()
 		local aim = ownerPly:getAimVector()
-		local cosLock = math.cos(math.rad(LOCK_ANGLE))
 
-		local best, bestDot
+		local best, bestScore
+
+		local function consider(ent, point, radius, bonus)
+			local dist = (point - eye):getLength()
+			if dist <= 0 or dist > LOCK_DIST then return end
+
+			local score = coneScore(eye, aim, point, radius, dist)
+			if not score or score > LOCK_ANGLE then return end
+
+			score = score - (bonus or 0) -- меньше = лучше
+			if bestScore and score >= bestScore then return end
+			if not visible(eye, point, ent) then return end
+
+			best, bestScore = ent, score
+		end
+
+		-- игроки
 		for _, ply in ipairs(find.allPlayers()) do
 			if ply:isValid() and ply ~= ownerPly and ply:isAlive() then
-				local point = ply:getPos() + Vector(0, 0, 40)
-				local delta = point - eye
-				local dist = delta:getLength()
-				if dist > 0 and dist <= LOCK_DIST then
-					local dot = (delta / dist):dot(aim)
-					if dot >= cosLock and (bestDot == nil or dot > bestDot) then
-						if visible(eye, point, ply) then
-							best, bestDot = ply, dot
-						end
-					end
-				end
+				consider(ply, ply:getPos() + Vector(0, 0, 40), 32, 3)
 			end
 		end
+
+		-- техника (машины, кресла/поды, джепы...)
+		for _, veh in ipairs(vehicles) do
+			if veh:isValid() then
+				local point, radius = centerOf(veh)
+				consider(veh, point, radius)
+			end
+		end
+
 		return best
 	end
 
-	local syncT = 0
+	local syncT, vehT = 0, 0
 
 	-- Скан 10 раз в секунду. Состояние отправляем при изменении и раз в секунду
 	-- (чтобы клиент, загрузившийся позже, всё равно получил актуальный захват).
 	timer.create("stinger_scan", 0.1, 0, function()
-		syncT = syncT + 0.1
+		syncT, vehT = syncT + 0.1, vehT + 0.1
+
+		if vehT >= 0.4 or #vehicles == 0 then
+			vehT = 0
+			refreshVehicles()
+		end
 
 		if not rpgHeld() then
 			target = nil
@@ -197,10 +294,10 @@ if SERVER then
 			return
 		end
 
-		-- доворот к цели
+		-- доворот к цели (работает и для игроков, и для техники)
 		local tgtPoint
-		if rTarget and rTarget:isValid() and rTarget:isAlive() then
-			tgtPoint = rTarget:getPos() + Vector(0, 0, 40)
+		if marksTarget(rTarget) then
+			tgtPoint = aimPointOf(rTarget)
 			local want = (tgtPoint - rPos):getNormalized()
 			rDir = (rDir + want * math.clamp(dt * ROCKET_TURN, 0, 1)):getNormalized()
 		end
@@ -208,7 +305,7 @@ if SERVER then
 		local oldPos = rPos
 		local newPos = rPos + rDir * (ROCKET_SPEED * dt)
 
-		-- попадание в мир / проп / игрока
+		-- попадание в мир / проп / игрока / технику
 		local tr = trace.line(oldPos, newPos, { ownerPly, chip() }, MASK.SHOT)
 		if tr.Hit then
 			boom(tr.HitPos)
@@ -244,7 +341,7 @@ if SERVER then
 		if ent:getPos():getDistance(ownerPly:getShootPos()) > SHOT_RANGE then return end
 
 		local tgt = target
-		if not (tgt and tgt:isValid() and tgt:isAlive()) then return end
+		if not marksTarget(tgt) then return end
 
 		-- Убираем обычную ракету, иначе будет двойной взрыв.
 		-- Если сервер запрещает удалять (проп-защита), просто не мешаем.
@@ -255,7 +352,7 @@ if SERVER then
 		-- одна ракета за раз
 		if flying then return end
 
-		spawnRocket(pos, ((tgt:getPos() + Vector(0, 0, 40)) - pos):getNormalized(), tgt)
+		spawnRocket(pos, (aimPointOf(tgt) - pos):getNormalized(), tgt)
 	end)
 
 else
@@ -263,19 +360,22 @@ else
 	-- =============================================================== клиент
 	local me = player()
 	local isOwner = false
-	do
-		local own = owner()
-		if me:isValid() and own:isValid() then
-			-- сравнение по SteamID: на клиенте объект владельца может быть другим wrapper'ом
-			isOwner = me:SteamID() == own:SteamID()
+
+	local function checkOwner()
+		local p, own = player(), owner()
+		if p:isValid() and own:isValid() then
+			return p:getSteamID() == own:getSteamID()
 		end
+		return false
 	end
 
-	-- подстраховка на случай, если чип загрузился раньше игрока
-	if not isOwner then
+	isOwner = checkOwner()
+	if isOwner then
+		pcall(enableHud, nil, true) -- разрешаем чипу рисовать на своём HUD
+	else
+		-- подстраховка, если чип загрузился раньше игрока
 		timer.simple(1, function()
-			local p, o = player(), owner()
-			if p:isValid() and o:isValid() and p:SteamID() == o:SteamID() then
+			if checkOwner() then
 				isOwner = true
 				pcall(enableHud, nil, true)
 			end
@@ -287,11 +387,7 @@ else
 	local hudFont
 	local pulse = 0
 
-	if isOwner then
-		pcall(enableHud, nil, true) -- разрешаем чипу рисовать на своём HUD
-	end
-
-	do -- шрифт нужен только владельцу, но не страшно создать и заранее
+	do
 		local ok, font = pcall(render.createFont, "Roboto", 20, 700)
 		if ok then hudFont = font end
 	end
@@ -308,7 +404,7 @@ else
 	end)
 
 	-- Круг захвата: конус вокруг прицела, спроецированный на экран.
-	-- Так круг на HUD точно совпадает с тем, что проверяет сервер.
+	-- Так круг на HUD совпадает с тем, что проверяет сервер.
 	local SEGMENTS = 32
 	local PROJ_DIST = 2000
 	local ringSize = 54
@@ -332,6 +428,17 @@ else
 			end
 		end
 		return pts, center, bottom
+	end
+
+	-- Радиус метки на экране под габариты цели
+	local function screenRadius(point, radius, aim)
+		local ok, right = pcall(function() return aim:getAngle():getRight() end)
+		if not ok or not right then return ringSize * 0.5 end
+
+		local a = point:toScreen()
+		local b = (point + right * radius):toScreen()
+		if not a.visible or not b.visible then return ringSize * 0.5 end
+		return math.clamp(math.abs(b.x - a.x) + math.abs(b.y - a.y), 12, 220)
 	end
 
 	hook.add("drawhud", "stinger_hud", function()
@@ -368,13 +475,16 @@ else
 				render.drawSimpleText(bottom.x, bottom.y + 6, "LOCK", TEXT_ALIGN.CENTER, TEXT_ALIGN.TOP)
 			end
 
-			-- метка на цели
-			if lockTarget and lockTarget:isValid() and lockTarget:isAlive() then
-				local scr = (lockTarget:getPos() + Vector(0, 0, 40)):toScreen()
+			-- метка на цели (игрок или техника)
+			if marksTarget(lockTarget) then
+				local point, radius = aimPointOf(lockTarget)
+				local scr = point:toScreen()
 				if scr.visible then
 					pulse = (pulse + timer.frametime() * 3) % 1
+
+					local r = screenRadius(point, radius, aim) * (0.8 + pulse * 0.4)
 					render.setColor(Color(255, 40, 40, 90 + math.floor(pulse * 120)))
-					render.drawCircle(scr.x, scr.y, ringSize * 0.5 + pulse * 6)
+					render.drawCircle(scr.x, scr.y, r)
 					render.setColor(Color(255, 60, 60, 230))
 					render.drawFilledCircle(scr.x, scr.y, 3)
 				end
